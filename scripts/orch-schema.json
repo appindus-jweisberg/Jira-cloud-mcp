@@ -1,7 +1,11 @@
 {
   "_note": "ID map for the Assets 'Orchard Reference Data' schema (key ORCH). Created live 2026-07-29. The orchard_jira_sync job upserts objects by 'Orchard ID'. Do not edit objects by hand.",
   "workspaceId": "54312ac0-661d-4578-ab7f-81c799c73010",
-  "schema": { "id": "36", "key": "ORCH", "name": "Orchard Reference Data" },
+  "schema": {
+    "id": "36",
+    "key": "ORCH",
+    "name": "Orchard Reference Data"
+  },
   "objectTypes": {
     "contentCode": {
       "id": "51",
@@ -23,7 +27,25 @@
         "Orchard ID": "179",
         "Default Content Code": "180"
       }
+    },
+    "contentSetup": {
+      "id": "199",
+      "orchardSource": "platform.content_setup (current version only)",
+      "attributes": {
+        "Name": "479",
+        "Orchard ID": "480",
+        "Version": "481",
+        "Context": "482",
+        "Organization ID": "483",
+        "Is Default": "484",
+        "Content Code": "485",
+        "Products": "486"
+      },
+      "_note": "Context = organization name or 'Administrator' (global). Products is multi-value (maxCardinality 50) from platform.content_setup_product. ~2.6k objects — the sync relies on upsert change detection."
     }
   },
-  "referenceType": { "id": "4", "name": "Reference" }
+  "referenceType": {
+    "id": "4",
+    "name": "Reference"
+  }
 }

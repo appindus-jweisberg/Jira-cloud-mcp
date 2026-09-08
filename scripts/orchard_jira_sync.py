@@ -70,6 +70,7 @@ def _schema_map() -> dict:
 MAP = _schema_map()
 CC = MAP["objectTypes"]["contentCode"]
 PROD = MAP["objectTypes"]["product"]
+CSET = MAP["objectTypes"]["contentSetup"]
 
 # Accumulates per-module results for the run-status file (read by the beta-lab status page).
 _SUMMARY: list[dict] = []
@@ -104,16 +105,26 @@ def _assets(method: str, path: str, body: dict | None = None):
 
 
 def aql_all(object_type_id: str) -> list[dict]:
-    """Every object of a type, with attributes, paged."""
-    out, page = [], 1
+    """Every object of a type, with attributes, fully paged.
+
+    IMPORTANT: /object/aql pages on **startAt/maxResults**. The `page`/`resultPerPage`
+    params are silently IGNORED — the endpoint then returns its default 25 rows and reports
+    isLast=false forever, so a `page`-based loop reads the same 25 objects over and over.
+    That is a silent duplicate-creation bug for any type with >25 objects (Product sits at
+    exactly 25), because the existing-object map comes out short and upsert() then creates
+    instead of updating. Page on startAt and stop on a short page."""
+    out, start, size = [], 0, 100
     while True:
-        d = _assets("POST", f"/object/aql?page={page}&resultPerPage=100&includeAttributes=true",
+        d = _assets("POST",
+                    f"/object/aql?startAt={start}&maxResults={size}&includeAttributes=true",
                     {"qlQuery": f"objectTypeId = {object_type_id}"})
         vals = d.get("values") or d.get("objectEntries") or []
         out.extend(vals)
-        if len(vals) < 100:
+        if len(vals) < size:
             break
-        page += 1
+        start += size
+        if start > 200_000:  # loop guard
+            break
     return out
 
 
@@ -130,18 +141,60 @@ def attr_value(obj: dict, attr_id: str):
 
 
 def _attrs(pairs: dict) -> list[dict]:
-    """pairs {attribute_id: value}; skips None. Values are stringified."""
-    return [{"objectTypeAttributeId": str(aid),
-             "objectAttributeValues": [{"value": str(val)}]}
-            for aid, val in pairs.items() if val is not None and val != ""]
+    """pairs {attribute_id: value | [values]}; skips None/empty. Values are stringified.
+    A list writes a multi-value attribute (e.g. Content Setup -> Products)."""
+    out = []
+    for aid, val in pairs.items():
+        if val is None or val == "" or val == []:
+            continue
+        vals = val if isinstance(val, (list, tuple)) else [val]
+        # Assets TRIMS string values on write. Strip here so the value we send equals the
+        # value that comes back — otherwise change detection sees a permanent diff and
+        # rewrites those rows on every run (140 content-setup names hit this).
+        out.append({"objectTypeAttributeId": str(aid),
+                    "objectAttributeValues": [{"value": str(v).strip()} for v in vals]})
+    return out
+
+
+def attr_values(obj: dict, attr_id: str) -> list[str]:
+    """ALL values of an attribute (multi-value safe). References come back as object ids."""
+    out = []
+    for a in obj.get("attributes", []):
+        if str(a.get("objectTypeAttributeId")) == str(attr_id):
+            for v in a.get("objectAttributeValues", []):
+                if v.get("value") is not None:
+                    out.append(str(v["value"]))
+                else:
+                    ref = v.get("referencedObject") or {}
+                    if ref.get("id"):
+                        out.append(str(ref["id"]))
+    return out
+
+
+def _unchanged(attrs: list[dict], current: dict) -> bool:
+    """True only if every attribute we would write already holds exactly those values."""
+    for a in attrs:
+        want = sorted(v["value"] for v in a["objectAttributeValues"])
+        have = sorted(current.get(str(a["objectTypeAttributeId"]), []))
+        if want != have:
+            return False
+    return True
 
 
 def upsert(object_type_id: str, orchard_id_attr: str, existing: dict,
-           orchard_id: str, pairs: dict, apply: bool) -> tuple[str, str]:
-    """Create or full-update an object keyed on Orchard ID. Returns (action, object_id)."""
+           orchard_id: str, pairs: dict, apply: bool,
+           current: dict | None = None) -> tuple[str, str]:
+    """Create or full-update an object keyed on Orchard ID. Returns (action, object_id).
+
+    When `current` ({attr_id: [values]}, from _existing_full) is supplied and every
+    attribute we would write already matches, returns ("skip", id) with NO write. That is
+    what keeps the nightly run affordable on large types: content setups are ~2.6k objects
+    and growing ~170/month, so blind re-PUTs would mean thousands of writes every night."""
     obj_id = existing.get(orchard_id)
     attrs = _attrs(pairs)
     if obj_id:
+        if current is not None and _unchanged(attrs, current):
+            return "skip", obj_id
         if apply:
             _assets("PUT", f"/object/{obj_id}", {"attributes": attrs})
         return "update", obj_id
@@ -158,6 +211,19 @@ def _existing_map(object_type_id: str, orchard_id_attr: str) -> dict:
         oid = attr_value(o, orchard_id_attr)
         if oid:
             m[str(oid)] = o["id"]
+    return m
+
+
+def _existing_full(object_type_id: str, orchard_id_attr: str) -> dict:
+    """{orchard_id: (assets_object_id, {attr_id: [values]})} — feeds upsert's change detection."""
+    m = {}
+    for o in aql_all(object_type_id):
+        oid = attr_value(o, orchard_id_attr)
+        if not oid:
+            continue
+        cur = {str(a.get("objectTypeAttributeId")): attr_values(o, a.get("objectTypeAttributeId"))
+               for a in o.get("attributes", [])}
+        m[str(oid)] = (o["id"], cur)
     return m
 
 
@@ -221,6 +287,74 @@ def sync_products(apply: bool, cc_map: dict | None = None) -> None:
                      "create": creates, "update": updates, "warnings": warn, "ok": not warn})
 
 
+def sync_content_setups(apply: bool, cc_map: dict | None = None) -> None:
+    """Content setups -> Assets, so Jira can offer a real picker instead of a pasted URL
+    (PI-191; consumed by PI-192/PI-193). Only the CURRENT version of each setup is synced —
+    versions churn constantly and the picker only ever needs "the setup as it is now".
+
+    Large type (~2.6k objects, growing ~170/month), so this leans on upsert()'s change
+    detection: steady-state nightly runs should be almost all skips."""
+    if cc_map is None:  # standalone run
+        cc_map = _existing_map(CC["id"], CC["attributes"]["Orchard ID"])
+    prod_map = _existing_map(PROD["id"], PROD["attributes"]["Orchard ID"])
+    rows = orchard_rows(
+        "SELECT c.id, "
+        "  replace(replace(coalesce(c.name,''), E'\\t',' '), E'\\n',' '), "
+        "  coalesce(c.version::text,''), "
+        "  coalesce(c.organization_id::text,''), "
+        "  replace(coalesce(o.name,'Administrator'), E'\\t',' '), "
+        "  coalesce(c.content_code_id::text,''), "
+        "  coalesce(c.is_default::text,'false'), "
+        "  coalesce((SELECT string_agg(p.product_id::text, ',') "
+        "            FROM platform.content_setup_product p "
+        "            WHERE p.content_setup_id = c.id), '') "
+        "FROM platform.content_setup c "
+        "LEFT JOIN unit.organization o ON o.id = c.organization_id "
+        "ORDER BY c.name")
+    full = _existing_full(CSET["id"], CSET["attributes"]["Orchard ID"])
+    existing = {k: v[0] for k, v in full.items()}
+    a = CSET["attributes"]
+    creates = updates = skips = 0
+    miss_cc = 0
+    miss_prod = 0
+    for oid, name, ver, org_id, ctx, cc_id, is_def, prod_ids in rows:
+        pairs = {a["Name"]: name or "(unnamed)",
+                 a["Orchard ID"]: oid,
+                 a["Version"]: ver,
+                 a["Context"]: ctx,
+                 a["Organization ID"]: org_id,
+                 a["Is Default"]: "true" if is_def in ("t", "true", "True") else "false"}
+        if cc_id:
+            ref = cc_map.get(cc_id)
+            if ref:
+                pairs[a["Content Code"]] = ref
+            else:
+                miss_cc += 1
+        refs = [prod_map[x] for x in prod_ids.split(",") if x and x in prod_map]
+        if prod_ids and not refs:
+            miss_prod += 1
+        if refs:
+            pairs[a["Products"]] = refs
+        action, _ = upsert(CSET["id"], a["Orchard ID"], existing, oid, pairs, apply,
+                           current=full.get(oid, (None, None))[1])
+        creates += action == "create"
+        updates += action == "update"
+        skips += action == "skip"
+    warn = []
+    if miss_cc:
+        warn.append(f"{miss_cc} setups referenced a content code not in Assets (run content-codes)")
+    if miss_prod:
+        warn.append(f"{miss_prod} setups referenced products not in Assets (run products)")
+    print(f"[content-setups] source={len(rows)} existing={len(existing)} "
+          f"-> create={creates} update={updates} skip={skips}"
+          + ("" if apply else "  (dry-run)"), file=sys.stderr)
+    for w in warn:
+        print(f"[content-setups] WARN {w}", file=sys.stderr)
+    _SUMMARY.append({"module": "content-setups", "source": len(rows), "existing": len(existing),
+                     "create": creates, "update": updates, "skip": skips,
+                     "warnings": warn, "ok": True})
+
+
 def sync_unit_product(apply: bool) -> None:
     """Auto-populate the Unit Setup 'Orchard Product' asset from each serial's product code
     (delegates to backfill_orchard_product.py — reuses the proven REST write). Idempotent:
@@ -266,14 +400,14 @@ def sync_org_operator(apply: bool) -> None:
                      "returncode": proc.returncode, "tail": tail, "ok": proc.returncode == 0})
 
 
-MODULES = {"content-codes": None, "products": None, "unit-product": None,
-           "sim-types": None, "org-operator": None}
+MODULES = {"content-codes": None, "products": None, "content-setups": None,
+           "unit-product": None, "sim-types": None, "org-operator": None}
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--apply", action="store_true", help="execute writes (default: dry-run)")
-    ap.add_argument("--only", default="", help="comma list: content-codes,products,org-operator")
+    ap.add_argument("--only", default="", help="comma list: content-codes,products,content-setups,org-operator")
     args = ap.parse_args()
     if not WORKSPACE:
         sys.exit("ASSETS_WORKSPACE_ID not set")
@@ -291,6 +425,8 @@ def main() -> int:
             cc_map = sync_content_codes(args.apply)
         if "products" in only:
             sync_products(args.apply, cc_map)
+        if "content-setups" in only:
+            sync_content_setups(args.apply, cc_map)
         if "unit-product" in only:
             sync_unit_product(args.apply)
         if "sim-types" in only:
